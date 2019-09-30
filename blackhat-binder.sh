@@ -1,10 +1,5 @@
 #!/bin/bash
 
-# Author: mranonymous
-# Filename: blackhat-binder
-# Purpose: AV Evasion along with injecting a meterpreter payload into another apk file
- 
-
 if [ $# -lt 2 ] || [ ${1: -4} != ".apk" ] || [ ${2: -4} != ".apk" ]; then
     echo
     echo "-------------ERROR------------"
